@@ -297,3 +297,12 @@ class Detect(nn.Module):
 
 ![image](https://user-images.githubusercontent.com/62278179/222720439-8ca58107-4099-444f-a2e7-aa69d47ff6fd.png)
 
+损失函数的相关介绍：https://zhuanlan.zhihu.com/p/582265998
+评价指标参数：https://zhuanlan.zhihu.com/p/584772395
+TP：预测的框与真实框的 IOU 高于设置的阈值
+FP：错误的正样本，也即预测的框与真实框的 IOU 低于设置的阈值
+FN：错误的负样本，也就是存在目标的区域没有预测出目标框
+TN：一般目标检测中不指明该参数，也就是背景没有被预测成目标，该参数没有实际意义
+mAP: 表示类别 AP 平均精度
+PR曲线：由于设置阈值的不同会导致精度(P)和召回率(R)不同，从而可以构建两者的 PR 曲线
+AP: 表示平均精度，是针对某一类别来计算的，通常是 PR 曲线下方的面积
