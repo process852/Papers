@@ -28,7 +28,7 @@ backbone 参数解析：
 - from 表示从那一层获得输入数据， -1 表示上一层
 - number 表示该模块重复的次数
 - module 表示网络层的名字
-- args 
+- args 表示模块初始化的参数，例如卷积层的卷积核大小，步长等信息
 ```yaml
 # YOLOv5 backbone
 backbone:
@@ -46,3 +46,205 @@ backbone:
   ]
 ```
 
+模块重复的次数乘以深度因子，即得到实际的模块重复次数
+
+```python
+anchors, nc, gd, gw = d['anchors'], d['nc'], d['depth_multiple'], d['width_multiple']
+n = max(round(n * gd), 1) if n > 1 else n
+```
+
+`common.py` 包含了网络中使用的各个子模块部件。例如， `Conv` 主要是将普通的卷积+BN+激活函数打包成一个模块。
+
+```python
+class Conv(nn.Module):
+    # Standard convolution
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, act=True):  # ch_in, ch_out, kernel, stride, padding, groups
+        super(Conv, self).__init__()
+        self.conv = nn.Conv2d(c1, c2, k, s, autopad(k, p), groups=g, bias=False)
+        self.bn = nn.BatchNorm2d(c2)
+        self.act = nn.SiLU() if act is True else (act if isinstance(act, nn.Module) else nn.Identity())
+
+    def forward(self, x):
+        return self.act(self.bn(self.conv(x)))
+
+    def fuseforward(self, x):
+        return self.act(self.conv(x))
+```
+
+构建网络模型的源代码：
+
+```python
+def parse_model(d, ch):  # model_dict, input_channels(3)
+    logger.info('\n%3s%18s%3s%10s  %-40s%-30s' % ('', 'from', 'n', 'params', 'module', 'arguments'))
+    anchors, nc, gd, gw = d['anchors'], d['nc'], d['depth_multiple'], d['width_multiple']
+    na = (len(anchors[0]) // 2) if isinstance(anchors, list) else anchors  # number of anchors
+    no = na * (nc + 5)  # number of outputs = anchors * (classes + 5)
+    
+    # layers 按照顺序存放各个模块实例化对象
+    # save 用于保存输入不是来自前一层的索引，方便后续不同层特征图融合时读取数据
+    # c2 ch[-1] 表示其实的输入通道数目，默认是 3 , c2 表示每一层的输出通道数目
+    layers, save, c2 = [], [], ch[-1]  # layers, savelist, ch out
+    for i, (f, n, m, args) in enumerate(d['backbone'] + d['head']):  # from, number, module, args
+        m = eval(m) if isinstance(m, str) else m  # eval strings
+        for j, a in enumerate(args):
+            try:
+                args[j] = eval(a) if isinstance(a, str) else a  # eval strings
+            except:
+                pass
+
+        n = max(round(n * gd), 1) if n > 1 else n  # depth gain 计算该模块重复的次数
+        if m in [Conv, GhostConv, Bottleneck, GhostBottleneck, SPP, DWConv, MixConv2d, Focus, CrossConv, BottleneckCSP,
+                 C3, C3TR]:
+            c1, c2 = ch[f], args[0] # c1 表示输入通道数目， c2 表示输出通道数目
+            if c2 != no:  # if not output
+                c2 = make_divisible(c2 * gw, 8) # 乘以宽度因子计算实际的输出通道数目
+
+            args = [c1, c2, *args[1:]]
+            if m in [BottleneckCSP, C3, C3TR]:
+                args.insert(2, n)  # number of repeats
+                n = 1
+        elif m is nn.BatchNorm2d:
+            args = [ch[f]]
+        elif m is Concat:
+            c2 = sum([ch[x] for x in f])
+        elif m is Detect:
+            args.append([ch[x] for x in f])
+            if isinstance(args[1], int):  # number of anchors
+                args[1] = [list(range(args[1] * 2))] * len(f)
+        elif m is Contract:
+            c2 = ch[f] * args[0] ** 2
+        elif m is Expand:
+            c2 = ch[f] // args[0] ** 2
+        else:
+            c2 = ch[f]
+
+        m_ = nn.Sequential(*[m(*args) for _ in range(n)]) if n > 1 else m(*args)  # module
+        t = str(m)[8:-2].replace('__main__.', '')  # module type
+        np = sum([x.numel() for x in m_.parameters()])  # number params
+        m_.i, m_.f, m_.type, m_.np = i, f, t, np  # attach index, 'from' index, type, number params
+        logger.info('%3s%18s%3s%10.0f  %-40s%-30s' % (i, f, n, np, t, args))  # print
+        save.extend(x % i for x in ([f] if isinstance(f, int) else f) if x != -1)  # append to savelist
+        layers.append(m_)
+        if i == 0:
+            ch = []
+        ch.append(c2) # ch 用于记录每个模块输出的通道数目
+    return nn.Sequential(*layers), sorted(save)
+```
+
+`class Model` 实现包裹了实际的 yolov5 模型，同时包含了前向传播的计算，NMS 计算，初始化参数等方法。
+- `__init__(self, cfg='yolov5s.yaml', ch=3, nc=None, anchors=None)`
+```python
+def __init__(self, cfg='yolov5s.yaml', ch=3, nc=None, anchors=None):  # model, input channels, number of classes
+    super(Model, self).__init__()
+    if isinstance(cfg, dict):
+        self.yaml = cfg  # model dict
+    else:  # is *.yaml
+        import yaml  # for torch hub
+        self.yaml_file = Path(cfg).name
+        with open(cfg) as f:
+            self.yaml = yaml.load(f, Loader=yaml.SafeLoader)  # model dict
+
+    # Define model
+    ch = self.yaml['ch'] = self.yaml.get('ch', ch)  # input channels
+    if nc and nc != self.yaml['nc']:
+        logger.info(f"Overriding model.yaml nc={self.yaml['nc']} with nc={nc}")
+        self.yaml['nc'] = nc  # override yaml value
+    if anchors:
+        logger.info(f'Overriding model.yaml anchors with anchors={anchors}')
+        self.yaml['anchors'] = round(anchors)  # override yaml value
+    self.model, self.save = parse_model(deepcopy(self.yaml), ch=[ch])  # model, savelist
+    self.names = [str(i) for i in range(self.yaml['nc'])]  # default names
+    # print([x.shape for x in self.forward(torch.zeros(1, ch, 64, 64))])
+
+    # Build strides, anchors
+    m = self.model[-1]  # Detect()
+    if isinstance(m, Detect): # 判断最后一层是 Detect 层
+        s = 256  # 2x min stride
+        # 获取下采样倍率，默认是 [8, 16, 32]
+        m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s))])  # forward
+        m.anchors /= m.stride.view(-1, 1, 1)
+        check_anchor_order(m)
+        self.stride = m.stride
+        self._initialize_biases()  # only run once
+        # print('Strides: %s' % m.stride.tolist())
+
+    # Init weights, biases
+    initialize_weights(self)
+    self.info()
+    logger.info('')
+```
+- `forward`
+```python
+def forward(self, x, augment=False, profile=False):
+    if augment: # 数据增强的前向传播
+        img_size = x.shape[-2:]  # height, width
+        s = [1, 0.83, 0.67]  # scales
+        f = [None, 3, None]  # flips (2-ud, 3-lr)
+        y = []  # outputs
+        for si, fi in zip(s, f):
+            xi = scale_img(x.flip(fi) if fi else x, si, gs=int(self.stride.max()))
+            yi = self.forward_once(xi)[0]  # forward
+            # cv2.imwrite(f'img_{si}.jpg', 255 * xi[0].cpu().numpy().transpose((1, 2, 0))[:, :, ::-1])  # save
+            yi[..., :4] /= si  # de-scale
+            if fi == 2:
+                yi[..., 1] = img_size[0] - yi[..., 1]  # de-flip ud
+            elif fi == 3:
+                yi[..., 0] = img_size[1] - yi[..., 0]  # de-flip lr
+            y.append(yi)
+        return torch.cat(y, 1), None  # augmented inference, train
+    else: # 普通的前向传播
+        return self.forward_once(x, profile)  # single-scale inference, train
+```
+- `forward_once`
+```python
+def forward_once(self, x, profile=False):
+    y, dt = [], []  # outputs
+    for m in self.model:
+        if m.f != -1:  # if not from previous layer 需要融合多层特征图的模块
+            x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
+
+        if profile:
+            o = thop.profile(m, inputs=(x,), verbose=False)[0] / 1E9 * 2 if thop else 0  # FLOPS
+            t = time_synchronized()
+            for _ in range(10):
+                _ = m(x)
+            dt.append((time_synchronized() - t) * 100)
+            print('%10.1f%10.0f%10.1fms %-40s' % (o, m.np, dt[-1], m.type))
+
+        x = m(x)  # run
+        y.append(x if m.i in self.save else None)  # save output 保存后续需要融合的特征图
+
+    if profile:
+        print('%.1fms total' % sum(dt))
+    return x
+```
+- `fuse` 融合卷积和BN层的运算，加速推理速度
+```python
+def fuse(self):  # fuse model Conv2d() + BatchNorm2d() layers
+    print('Fusing layers... ')
+    for m in self.model.modules():
+        if type(m) is Conv and hasattr(m, 'bn'):
+            m.conv = fuse_conv_and_bn(m.conv, m.bn)  # update conv
+            delattr(m, 'bn')  # remove batchnorm
+            m.forward = m.fuseforward  # update forward
+    self.info()
+    return self
+```
+![image](https://user-images.githubusercontent.com/62278179/222716572-963eb35e-78fb-43fd-a73e-333eb7b4841b.png)
+
+- `nms` 用于在模型尾部添加 NMS 模块
+```python
+def nms(self, mode=True):  # add or remove NMS module
+    present = type(self.model[-1]) is NMS  # last layer is NMS
+    if mode and not present:
+        print('Adding NMS... ')
+        m = NMS()  # module
+        m.f = -1  # from
+        m.i = self.model[-1].i + 1  # index
+        self.model.add_module(name='%s' % m.i, module=m)  # add
+        self.eval()
+    elif not mode and present:
+        print('Removing NMS... ')
+        self.model = self.model[:-1]  # remove
+    return self
+```
